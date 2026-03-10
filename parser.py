@@ -128,6 +128,145 @@ def get_topic_nodes(parsed: dict) -> dict:
     return topic_nodes
 
 
+def parse_book_label(raw: str) -> dict:
+    """
+    Split a raw book cell value into title + author.
+    Handles both:
+      - Title<br><b>Author</b>
+      - <div>Title</div><div><b>Author</b></div>
+    """
+    raw = html.unescape(raw)
+
+    # Extract bold text as author
+    author_match = re.search(r"<b[^>]*>(.*?)</b>", raw, re.DOTALL)
+    author = strip_html(author_match.group(1)) if author_match else ""
+
+    # Remove the bold block, then strip remaining HTML for title
+    title_raw = re.sub(r"<b[^>]*>.*?</b>", "", raw, flags=re.DOTALL)
+    title = strip_html(title_raw)
+
+    return {"title": title, "author": author}
+
+
+def get_topic_books(parsed: dict, topic_node_ids: set) -> dict:
+    """
+    For each top-level topic node, collect its direct child book/resource cells.
+
+    Returns:
+        {topic_id: [{"title": str, "author": str, "category": str}, ...]}
+    """
+    nodes = parsed["nodes"]
+    books: dict = {tid: [] for tid in topic_node_ids}
+
+    for nid, node in nodes.items():
+        if node["is_container"] or not node["label"]:
+            continue
+
+        parent = node["parent"]
+        if not parent:
+            continue
+
+        # Direct child of a topic
+        if parent in topic_node_ids:
+            book = parse_book_label(
+                # Re-parse from the already-stored label isn't ideal but works
+                # because strip_html already ran; we re-derive from label here
+                node["label"]
+            )
+            # label at this point is already stripped; split on first word chunk
+            # that looks like an author (stored in node["label"] as "Title Author")
+            # Better: store raw value too — but we didn't. Use the stripped label
+            # and infer split from category (book cells never have children).
+            # Since strip_html already merged title+author, re-parse from raw:
+            books[parent].append({
+                "title": node["label"],   # full stripped text (title + author merged)
+                "author": "",
+                "category": node["category"],
+            })
+            continue
+
+        # Child of a sub-swimlane that is itself inside a topic
+        parent_node = nodes.get(parent)
+        if parent_node and parent_node["parent"] in topic_node_ids:
+            topic_id = parent_node["parent"]
+            books[topic_id].append({
+                "title": node["label"],
+                "author": "",
+                "category": node["category"],
+            })
+
+    return books
+
+
+def get_topic_books_rich(parsed_path: str, topic_node_ids: set) -> dict:
+    """
+    Re-parse the .drawio file a second time to get properly split
+    title/author for each book, without losing data from strip_html.
+
+    Returns:
+        {topic_id: [{"title": str, "author": str, "category": str}]}
+    """
+    tree = ET.parse(parsed_path)
+    root = tree.getroot()
+    all_cells = root.findall(".//mxCell")
+
+    # Build a quick parent→topic map (including grandparent resolution)
+    # We need node id → parent id from the full cell list
+    id_to_parent: dict = {}
+    id_to_style: dict  = {}
+    id_to_container: dict = {}
+    for cell in all_cells:
+        cid = cell.get("id", "")
+        style = cell.get("style", "")
+        parent = cell.get("parent", "")
+        if cid in ("0", "1"):
+            continue
+        id_to_parent[cid] = parent
+        id_to_style[cid]  = style
+        id_to_container[cid] = "swimlane" in style
+
+    def resolve_topic(cid: str):
+        p = id_to_parent.get(cid, "")
+        if p in topic_node_ids:
+            return p
+        gp = id_to_parent.get(p, "")
+        if gp in topic_node_ids:
+            return gp
+        return None
+
+    books: dict = {tid: [] for tid in topic_node_ids}
+
+    for cell in all_cells:
+        cid   = cell.get("id", "")
+        value = cell.get("value", "")
+        style = cell.get("style", "")
+        vertex = cell.get("vertex")
+
+        if not vertex or not value or "swimlane" in style:
+            continue
+        if cid in ("0", "1"):
+            continue
+        if not id_to_container.get(cid, False) and "<b>" not in value and "<div>" not in value:
+            continue
+
+        topic_id = resolve_topic(cid)
+        if topic_id is None:
+            continue
+
+        book = parse_book_label(value)
+        if not book["title"]:
+            continue
+
+        cat = _infer_category(style)
+        books[topic_id].append({
+            "title":    book["title"],
+            "author":   book["author"],
+            "category": cat,
+        })
+
+    return books
+
+
 def get_topic_edges(parsed: dict, topic_node_ids: set) -> list:
     """
     Filter edges to only those connecting top-level topic nodes.

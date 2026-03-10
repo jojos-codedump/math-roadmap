@@ -82,6 +82,12 @@ def main():
 
     args = parser.parse_args()
 
+    # ── No start/end args → launch TUI ───────────────────────────
+    if not args.start and not args.end and not args.list:
+        from tui import launch
+        launch(args.file)
+        return
+
     # ── Load and build graph ──────────────────────────────────────
     print(f"\n  🔍 Loading: {args.file}")
     try:
